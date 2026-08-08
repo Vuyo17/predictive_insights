@@ -1,0 +1,7 @@
+{
+  "notes": "Optional: add known public leaderboard AUC per submission file.",
+  "scores": {
+    "submission.csv": 0.62719,
+    "submission_.csv": 0.62528
+  }
+}

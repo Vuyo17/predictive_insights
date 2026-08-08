@@ -1,0 +1,64 @@
+{
+  "status": "running",
+  "started_at": "2026-08-08T14:07:42.633802",
+  "updated_at": "2026-08-08T14:07:44.867167",
+  "initial_baseline": 0.62719,
+  "current_best_cv_auc": 0.6444976909080784,
+  "iterations_completed": 1,
+  "last_iteration": {
+    "iteration": 1,
+    "candidate_name": "hgb_random",
+    "params": {
+      "learning_rate": 0.036251,
+      "max_depth": 7,
+      "max_iter": 385,
+      "min_samples_leaf": 19,
+      "l2_regularization": 0.055815,
+      "seed": 1719584
+    },
+    "mean_auc": 0.6444976909080784,
+    "std_auc": 0.000478381305214326,
+    "fold_scores": [
+      0.6449760722132927,
+      0.644019309602864
+    ],
+    "best_before": 0.62719,
+    "improved": true,
+    "timestamp": "2026-08-08T14:07:42.633802",
+    "artifacts": {
+      "submission_path": "c:\\Users\\Student\\Downloads\\predictive_insights\\outputs\\submission_cont_hgb_random_iter1_20260808_140744.csv",
+      "oof_path": "c:\\Users\\Student\\Downloads\\predictive_insights\\outputs\\oof_cont_hgb_random_iter1_20260808_140744.csv",
+      "report_path": "c:\\Users\\Student\\Downloads\\predictive_insights\\outputs\\continuous_report_cont_hgb_random_iter1_20260808_140744.json"
+    },
+    "best_after": 0.6444976909080784
+  },
+  "history_tail": [
+    {
+      "iteration": 1,
+      "candidate_name": "hgb_random",
+      "params": {
+        "learning_rate": 0.036251,
+        "max_depth": 7,
+        "max_iter": 385,
+        "min_samples_leaf": 19,
+        "l2_regularization": 0.055815,
+        "seed": 1719584
+      },
+      "mean_auc": 0.6444976909080784,
+      "std_auc": 0.000478381305214326,
+      "fold_scores": [
+        0.6449760722132927,
+        0.644019309602864
+      ],
+      "best_before": 0.62719,
+      "improved": true,
+      "timestamp": "2026-08-08T14:07:42.633802",
+      "artifacts": {
+        "submission_path": "c:\\Users\\Student\\Downloads\\predictive_insights\\outputs\\submission_cont_hgb_random_iter1_20260808_140744.csv",
+        "oof_path": "c:\\Users\\Student\\Downloads\\predictive_insights\\outputs\\oof_cont_hgb_random_iter1_20260808_140744.csv",
+        "report_path": "c:\\Users\\Student\\Downloads\\predictive_insights\\outputs\\continuous_report_cont_hgb_random_iter1_20260808_140744.json"
+      },
+      "best_after": 0.6444976909080784
+    }
+  ]
+}

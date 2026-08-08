@@ -1,0 +1,25 @@
+{
+  "nodes": [
+    {
+      "name": "primary",
+      "host": "nightmare.cs.uct.ac.za",
+      "user": "mtmluv001",
+      "project_dir": "~/predictive_insights",
+      "frontend": true,
+      "backend": true,
+      "python_bin": "python3",
+      "npm_bin": "__missing_npm__",
+      "port": 5173
+    },
+    {
+      "name": "worker_2",
+      "host": "nightmare.cs.uct.ac.za",
+      "user": "khlhlo002",
+      "project_dir": "~/predictive_insights",
+      "frontend": false,
+      "backend": true,
+      "python_bin": "python3",
+      "npm_bin": "npm"
+    }
+  ]
+}

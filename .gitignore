@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.venv/
+outputs/*.csv
+outputs/*.json
+outputs/*.joblib
+*.ipynb_checkpoints/
+frontend/node_modules/
+frontend/dist/
+frontend/public/submissions/
+frontend/src/data/submissions.json
+frontend/src/data/server_logs.json
+ops/frontend_start_debug.txt
+ops/_probe.txt
+outputs/terminal_probe.txt
