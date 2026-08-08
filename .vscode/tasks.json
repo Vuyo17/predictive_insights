@@ -184,6 +184,21 @@
 			"label": "git-commit-local",
 			"type": "shell",
 			"command": "git config user.name \"Vuyo17\"; git config user.email \"luvuyomatomela17@gmail.com\"; git add .vscode/tasks.json; git add .; git commit -m \"Initial hackathon pipeline, dashboard, and cluster orchestration\"; git status --short"
+		},
+		{
+			"label": "git-commit-local-quoted",
+			"type": "shell",
+			"command": "git commit -m 'Initial hackathon pipeline dashboard and cluster orchestration'; git rev-parse --short HEAD; git status --short"
+		},
+		{
+			"label": "git-add-remote-and-push",
+			"type": "shell",
+			"command": "git remote add origin https://github.com/Vuyo17/predictive_insights.git 2>$null; git remote set-url origin https://github.com/Vuyo17/predictive_insights.git; git push -u origin main"
+		},
+		{
+			"label": "check-gh-cli",
+			"type": "shell",
+			"command": "gh --version; gh auth status"
 		}
 	]
 }
