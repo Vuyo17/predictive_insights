@@ -1,6 +1,10 @@
 $ErrorActionPreference = 'Stop'
 $ScriptRoot = Split-Path -Parent $PSCommandPath
 Set-Location $ScriptRoot
+$LogDir = Join-Path $ScriptRoot 'logs'
+New-Item -Path $LogDir -ItemType Directory -Force | Out-Null
+$LogPath = Join-Path $LogDir ("start_controller_{0}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+Start-Transcript -Path $LogPath -Append | Out-Null
 
 function Invoke-Checked {
   param(
@@ -78,9 +82,72 @@ function Ensure-RepoShape {
   }
 }
 
+function Get-RequirementsHash {
+  return (Get-FileHash -Algorithm SHA256 -Path (Join-Path $ScriptRoot 'requirements.txt')).Hash
+}
+
+function Get-PythonVersionString {
+  param([string]$PythonExe)
+  return (& $PythonExe -c "import sys; print(sys.version.split()[0])").Trim()
+}
+
+function Should-InstallDependencies {
+  param([string]$PythonExe)
+
+  $statePath = Join-Path $ScriptRoot '.bootstrap_controller_state.json'
+  $reqHash = Get-RequirementsHash
+  $pyVersion = Get-PythonVersionString -PythonExe $PythonExe
+  $fingerprint = "$reqHash|$pyVersion"
+
+  if (-not (Test-Path $statePath)) {
+    return @{ Install = $true; Fingerprint = $fingerprint }
+  }
+
+  try {
+    $raw = Get-Content -Path $statePath -Raw
+    $obj = $raw | ConvertFrom-Json
+    if ($obj.fingerprint -eq $fingerprint) {
+      return @{ Install = $false; Fingerprint = $fingerprint }
+    }
+  } catch {}
+
+  return @{ Install = $true; Fingerprint = $fingerprint }
+}
+
+function Write-InstallState {
+  param([string]$Fingerprint)
+  $statePath = Join-Path $ScriptRoot '.bootstrap_controller_state.json'
+  $payload = @{
+    updated_at = (Get-Date).ToString('o')
+    fingerprint = $Fingerprint
+  } | ConvertTo-Json
+  Set-Content -Path $statePath -Value $payload -Encoding UTF8
+}
+
+function Test-ControllerAlreadyRunning {
+  $conn = Get-NetTCPConnection -LocalPort 8765 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($null -eq $conn) {
+    return $false
+  }
+
+  $proc = Get-CimInstance Win32_Process -Filter ("ProcessId = " + $conn.OwningProcess)
+  if ($null -ne $proc -and $proc.CommandLine -like '*distributed_controller.py*') {
+    Write-Host "Controller already running on port 8765 (PID $($conn.OwningProcess))."
+    return $true
+  }
+
+  throw "Port 8765 is already in use by PID $($conn.OwningProcess)."
+}
+
 try {
   Write-Host 'Starting distributed controller setup...'
   Ensure-RepoShape
+
+  if (Test-ControllerAlreadyRunning) {
+    Write-Host "Log file: $LogPath"
+    exit 0
+  }
+
   $venvPython = Resolve-VenvPythonPath
 
   if (-not $venvPython) {
@@ -105,9 +172,14 @@ try {
     Ensure-Python | Out-Null
   }
 
-  Write-Host 'Installing dependencies...'
-  Invoke-Checked -FilePath $venvPython -Arguments @('-m', 'pip', 'install', '--upgrade', 'pip') -StepName 'pip self-upgrade'
-  Invoke-Checked -FilePath $venvPython -Arguments @('-m', 'pip', 'install', '-r', (Join-Path $ScriptRoot 'requirements.txt')) -StepName 'requirements install'
+  $installDecision = Should-InstallDependencies -PythonExe $venvPython
+  if ($installDecision.Install) {
+    Write-Host 'Installing dependencies (requirements changed or first run)...'
+    Invoke-Checked -FilePath $venvPython -Arguments @('-m', 'pip', 'install', '-r', (Join-Path $ScriptRoot 'requirements.txt')) -StepName 'requirements install'
+    Write-InstallState -Fingerprint $installDecision.Fingerprint
+  } else {
+    Write-Host 'Dependencies already up to date. Skipping installation.'
+  }
 
   Write-Host 'Launching controller...'
   Invoke-Checked -FilePath $venvPython -Arguments @((Join-Path $ScriptRoot 'src\distributed_controller.py'), '--host', '0.0.0.0', '--port', '8765', '--discovery-port', '50555') -StepName 'controller startup'
@@ -116,5 +188,9 @@ catch {
   Write-Host ''
   Write-Host 'start_controller.ps1 failed:' -ForegroundColor Red
   Write-Host $_.Exception.Message -ForegroundColor Red
+  Write-Host "Log file: $LogPath" -ForegroundColor Yellow
   exit 1
+}
+finally {
+  try { Stop-Transcript | Out-Null } catch {}
 }

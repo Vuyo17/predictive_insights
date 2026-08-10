@@ -79,7 +79,7 @@ def run_worker(args: argparse.Namespace) -> None:
     if not controller_url:
         controller_url = discover_controller(args.discovery_port, args.discovery_timeout)
         if not controller_url:
-            raise RuntimeError("Could not discover controller on LAN. Provide --controller-url explicitly.")
+            raise SystemExit("Could not discover controller on LAN. Provide --controller-url explicitly.")
 
     print(f"Controller: {controller_url}")
     X_train, y = prepare_data(args.data_dir, args.train_file, args.test_file, args.max_round)
@@ -161,4 +161,10 @@ def parse_args() -> argparse.Namespace:
 
 
 if __name__ == "__main__":
-    run_worker(parse_args())
+    try:
+        run_worker(parse_args())
+    except SystemExit:
+        raise
+    except Exception as exc:
+        print(f"Worker failed: {exc}")
+        raise SystemExit(1)
