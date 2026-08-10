@@ -4,12 +4,29 @@ if ($args.Count -gt 0) {
 }
 
 $ErrorActionPreference = 'Stop'
+$ScriptRoot = Split-Path -Parent $PSCommandPath
+Set-Location $ScriptRoot
+
+function Resolve-VenvPythonPath {
+  $candidates = @(
+    (Join-Path $ScriptRoot ".venv\Scripts\python.exe"),
+    (Join-Path $ScriptRoot ".venv\python.exe"),
+    (Join-Path $ScriptRoot ".venv\bin\python.exe"),
+    (Join-Path $ScriptRoot ".venv\bin\python")
+  )
+  foreach ($path in $candidates) {
+    if (Test-Path $path) {
+      return $path
+    }
+  }
+  return $null
+}
 
 function Ensure-RepoShape {
-  if (-not (Test-Path .\requirements.txt)) {
+  if (-not (Test-Path (Join-Path $ScriptRoot 'requirements.txt'))) {
     throw 'requirements.txt not found. Run this script from the repository root.'
   }
-  if (-not (Test-Path .\src\distributed_worker.py)) {
+  if (-not (Test-Path (Join-Path $ScriptRoot 'src\distributed_worker.py'))) {
     throw 'src\distributed_worker.py not found. Run this script from the repository root.'
   }
 }
@@ -72,27 +89,32 @@ try {
   Write-Host 'Starting worker setup...'
   Ensure-RepoShape
   $bootstrap = Ensure-Python
+  $venvPython = Resolve-VenvPythonPath
 
-  if (-not (Test-Path .\.venv\Scripts\python.exe)) {
+  if (-not $venvPython) {
     Write-Host 'Creating virtual environment (.venv)...'
     if ($bootstrap -eq 'py') {
-      py -3.12 -m venv .venv
+      py -3.12 -m venv (Join-Path $ScriptRoot '.venv')
     } else {
-      python -m venv .venv
+      python -m venv (Join-Path $ScriptRoot '.venv')
+    }
+    $venvPython = Resolve-VenvPythonPath
+    if (-not $venvPython) {
+      throw 'Virtual environment was created but python executable was not found under .venv.'
     }
   }
 
   Write-Host 'Installing dependencies...'
-  .\.venv\Scripts\python.exe -m pip install --upgrade pip
-  .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+  & $venvPython -m pip install --upgrade pip
+  & $venvPython -m pip install -r (Join-Path $ScriptRoot 'requirements.txt')
 
   Write-Host 'Launching worker...'
   if ([string]::IsNullOrWhiteSpace($ControllerUrl)) {
     # Auto-discover controller on LAN and join.
-    .\.venv\Scripts\python.exe .\src\distributed_worker.py
+    & $venvPython (Join-Path $ScriptRoot 'src\distributed_worker.py')
   } else {
     # Direct connect fallback when LAN discovery is blocked.
-    .\.venv\Scripts\python.exe .\src\distributed_worker.py --controller-url $ControllerUrl
+    & $venvPython (Join-Path $ScriptRoot 'src\distributed_worker.py') --controller-url $ControllerUrl
   }
 }
 catch {

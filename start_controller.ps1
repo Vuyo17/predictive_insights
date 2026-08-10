@@ -1,4 +1,21 @@
 $ErrorActionPreference = 'Stop'
+$ScriptRoot = Split-Path -Parent $PSCommandPath
+Set-Location $ScriptRoot
+
+function Resolve-VenvPythonPath {
+  $candidates = @(
+    (Join-Path $ScriptRoot ".venv\Scripts\python.exe"),
+    (Join-Path $ScriptRoot ".venv\python.exe"),
+    (Join-Path $ScriptRoot ".venv\bin\python.exe"),
+    (Join-Path $ScriptRoot ".venv\bin\python")
+  )
+  foreach ($path in $candidates) {
+    if (Test-Path $path) {
+      return $path
+    }
+  }
+  return $null
+}
 
 function Test-PythonRuntime {
   param([string]$Command)
@@ -37,10 +54,10 @@ function Ensure-Python {
 }
 
 function Ensure-RepoShape {
-  if (-not (Test-Path .\requirements.txt)) {
+  if (-not (Test-Path (Join-Path $ScriptRoot 'requirements.txt'))) {
     throw 'requirements.txt not found. Run this script from the repository root.'
   }
-  if (-not (Test-Path .\src\distributed_controller.py)) {
+  if (-not (Test-Path (Join-Path $ScriptRoot 'src\distributed_controller.py'))) {
     throw 'src\distributed_controller.py not found. Run this script from the repository root.'
   }
 }
@@ -48,25 +65,30 @@ function Ensure-RepoShape {
 try {
   Write-Host 'Starting distributed controller setup...'
   Ensure-RepoShape
+  $venvPython = Resolve-VenvPythonPath
 
-  if (-not (Test-Path .\.venv\Scripts\python.exe)) {
+  if (-not $venvPython) {
     $bootstrap = Ensure-Python
     Write-Host 'Creating virtual environment (.venv)...'
     if ($bootstrap -eq 'py') {
-      & py -3.12 -m venv .venv
+      & py -3.12 -m venv (Join-Path $ScriptRoot '.venv')
     } else {
-      & python -m venv .venv
+      & python -m venv (Join-Path $ScriptRoot '.venv')
+    }
+    $venvPython = Resolve-VenvPythonPath
+    if (-not $venvPython) {
+      throw 'Virtual environment was created but python executable was not found under .venv.'
     }
   } else {
     Ensure-Python | Out-Null
   }
 
   Write-Host 'Installing dependencies...'
-  .\.venv\Scripts\python.exe -m pip install --upgrade pip
-  .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+  & $venvPython -m pip install --upgrade pip
+  & $venvPython -m pip install -r (Join-Path $ScriptRoot 'requirements.txt')
 
   Write-Host 'Launching controller...'
-  .\.venv\Scripts\python.exe .\src\distributed_controller.py --host 0.0.0.0 --port 8765 --discovery-port 50555
+  & $venvPython (Join-Path $ScriptRoot 'src\distributed_controller.py') --host 0.0.0.0 --port 8765 --discovery-port 50555
 }
 catch {
   Write-Host ''
