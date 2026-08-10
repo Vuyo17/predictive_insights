@@ -3,6 +3,9 @@ __pycache__/
 .venv/
 .env
 .improver_state.json
+.bootstrap_controller_state.json
+.bootstrap_worker_state.json
+logs/
 outputs/*.csv
 outputs/*.json
 outputs/*.joblib
