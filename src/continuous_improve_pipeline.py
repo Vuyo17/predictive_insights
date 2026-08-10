@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
 from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import ExtraTreesClassifier
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
@@ -339,6 +340,52 @@ def build_logreg_model(
     return Pipeline(steps=[("prep", preprocessor), ("model", model)])
 
 
+def build_extratrees_model(
+    X: pd.DataFrame,
+    n_estimators: int,
+    max_depth: Optional[int],
+    min_samples_leaf: int,
+    max_features: str,
+    random_state: int,
+) -> Pipeline:
+    numeric_features, categorical_features = split_columns(X)
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            (
+                "num",
+                Pipeline(steps=[("imputer", SimpleImputer(strategy="median"))]),
+                numeric_features,
+            ),
+            (
+                "cat",
+                Pipeline(
+                    steps=[
+                        ("imputer", SimpleImputer(strategy="most_frequent")),
+                        (
+                            "encoder",
+                            OneHotEncoder(handle_unknown="ignore", min_frequency=20),
+                        ),
+                    ]
+                ),
+                categorical_features,
+            ),
+        ],
+        remainder="drop",
+    )
+
+    model = ExtraTreesClassifier(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        min_samples_leaf=min_samples_leaf,
+        max_features=max_features,
+        n_jobs=1,
+        random_state=random_state,
+    )
+
+    return Pipeline(steps=[("prep", preprocessor), ("model", model)])
+
+
 def bounded_int(value: int, low: int, high: int) -> int:
     return max(low, min(high, int(value)))
 
@@ -365,7 +412,7 @@ def sample_candidate(
 
     best_params = best_candidate.get("params", {}) if best_candidate else {}
 
-    if mix_choice < 0.6:
+    if mix_choice < 0.45:
         if use_refine and best_candidate and str(best_candidate.get("candidate_name", "")).startswith("hgb"):
             params = {
                 "learning_rate": perturb_float(
@@ -404,6 +451,43 @@ def sample_candidate(
         )
         return candidate_name, params, [(1.0, model)]
 
+    if mix_choice < 0.65:
+        if use_refine and best_candidate and str(best_candidate.get("candidate_name", "")).startswith("et"):
+            max_depth_raw = best_params.get("max_depth", 18)
+            if max_depth_raw in (None, "none"):
+                max_depth_center = 18
+            else:
+                max_depth_center = int(max_depth_raw)
+
+            sampled_depth = perturb_int(rng, max_depth_center, 4, 8, 32)
+            params = {
+                "n_estimators": perturb_int(rng, int(best_params.get("n_estimators", 450)), 80, 200, 1000),
+                "max_depth": int(sampled_depth),
+                "min_samples_leaf": perturb_int(rng, int(best_params.get("min_samples_leaf", 3)), 1, 1, 10),
+                "max_features": str(best_params.get("max_features", "sqrt")),
+                "seed": int(rng.randint(1, 10_000_000)),
+            }
+            candidate_name = "et_refine"
+        else:
+            params = {
+                "n_estimators": int(rng.randint(300, 900)),
+                "max_depth": int(rng.randint(10, 30)),
+                "min_samples_leaf": int(rng.randint(1, 8)),
+                "max_features": "sqrt" if rng.random() < 0.75 else "log2",
+                "seed": int(rng.randint(1, 10_000_000)),
+            }
+            candidate_name = "et_random"
+
+        model = build_extratrees_model(
+            X,
+            n_estimators=int(params["n_estimators"]),
+            max_depth=int(params["max_depth"]),
+            min_samples_leaf=int(params["min_samples_leaf"]),
+            max_features=str(params["max_features"]),
+            random_state=int(params["seed"]),
+        )
+        return candidate_name, params, [(1.0, model)]
+
     if use_refine and best_candidate and "hgb_learning_rate" in best_params:
         hgb_params = {
             "learning_rate": perturb_float(
@@ -428,6 +512,7 @@ def sample_candidate(
             bounded_float(float(best_params.get("hgb_weight", 0.65)) + rng.uniform(-0.08, 0.08), 0.5, 0.85),
             4,
         )
+        et_weight = round(bounded_float(float(best_params.get("et_weight", 0.0)) + rng.uniform(-0.06, 0.06), 0.0, 0.35), 4)
         candidate_name = "blend_refine"
     else:
         hgb_params = {
@@ -443,9 +528,37 @@ def sample_candidate(
             "max_iter": int(rng.randint(900, 2200)),
             "seed": int(rng.randint(1, 10_000_000)),
         }
-        hgb_weight = round(rng.uniform(0.55, 0.8), 4)
+        et_params = {
+            "n_estimators": int(rng.randint(320, 820)),
+            "max_depth": int(rng.randint(10, 28)),
+            "min_samples_leaf": int(rng.randint(1, 6)),
+            "max_features": "sqrt" if rng.random() < 0.75 else "log2",
+            "seed": int(rng.randint(1, 10_000_000)),
+        }
+
+        hgb_weight = round(rng.uniform(0.45, 0.75), 4)
+        et_weight = round(rng.uniform(0.0, 0.3), 4)
         candidate_name = "blend_random"
-    logreg_weight = round(1.0 - hgb_weight, 4)
+    if "et_params" not in locals():
+        et_params = {
+            "n_estimators": int(best_params.get("et_n_estimators", 520)),
+            "max_depth": int(best_params.get("et_max_depth", 18)),
+            "min_samples_leaf": int(best_params.get("et_min_samples_leaf", 3)),
+            "max_features": str(best_params.get("et_max_features", "sqrt")),
+            "seed": int(rng.randint(1, 10_000_000)),
+        }
+
+    total = hgb_weight + et_weight
+    if total >= 0.95:
+        scale = 0.95 / total
+        hgb_weight = round(hgb_weight * scale, 4)
+        et_weight = round(et_weight * scale, 4)
+    logreg_weight = round(1.0 - hgb_weight - et_weight, 4)
+    if logreg_weight < 0.05:
+        deficit = 0.05 - logreg_weight
+        hgb_weight = round(max(0.35, hgb_weight - (deficit * 0.7)), 4)
+        et_weight = round(max(0.0, et_weight - (deficit * 0.3)), 4)
+        logreg_weight = round(1.0 - hgb_weight - et_weight, 4)
 
     hgb_model = build_hgb_model(
         X,
@@ -463,6 +576,14 @@ def sample_candidate(
         class_weight="balanced",
         random_state=int(logreg_params["seed"]),
     )
+    et_model = build_extratrees_model(
+        X,
+        n_estimators=int(et_params["n_estimators"]),
+        max_depth=int(et_params["max_depth"]),
+        min_samples_leaf=int(et_params["min_samples_leaf"]),
+        max_features=str(et_params["max_features"]),
+        random_state=int(et_params["seed"]),
+    )
 
     params = {
         "hgb_weight": hgb_weight,
@@ -473,12 +594,21 @@ def sample_candidate(
         "hgb_min_samples_leaf": hgb_params["min_samples_leaf"],
         "hgb_l2_regularization": hgb_params["l2_regularization"],
         "hgb_seed": hgb_params["seed"],
+        "et_weight": et_weight,
+        "et_n_estimators": et_params["n_estimators"],
+        "et_max_depth": et_params["max_depth"],
+        "et_min_samples_leaf": et_params["min_samples_leaf"],
+        "et_max_features": et_params["max_features"],
+        "et_seed": et_params["seed"],
         "logreg_c": logreg_params["c"],
         "logreg_max_iter": logreg_params["max_iter"],
         "logreg_seed": logreg_params["seed"],
     }
 
-    return candidate_name, params, [(hgb_weight, hgb_model), (logreg_weight, logreg_model)]
+    weighted = [(hgb_weight, hgb_model), (logreg_weight, logreg_model)]
+    if et_weight > 0.0:
+        weighted.append((et_weight, et_model))
+    return candidate_name, params, weighted
 
 
 def build_weighted_models(
@@ -494,6 +624,17 @@ def build_weighted_models(
             max_iter=int(params["max_iter"]),
             min_samples_leaf=int(params["min_samples_leaf"]),
             l2_regularization=float(params["l2_regularization"]),
+            random_state=int(params["seed"]),
+        )
+        return [(1.0, model)]
+
+    if candidate_name.startswith("et"):
+        model = build_extratrees_model(
+            X,
+            n_estimators=int(params["n_estimators"]),
+            max_depth=int(params["max_depth"]),
+            min_samples_leaf=int(params["min_samples_leaf"]),
+            max_features=str(params["max_features"]),
             random_state=int(params["seed"]),
         )
         return [(1.0, model)]
@@ -514,10 +655,24 @@ def build_weighted_models(
         class_weight="balanced",
         random_state=int(params.get("logreg_seed", 42)),
     )
-    return [
+    weighted: List[Tuple[float, Pipeline]] = [
         (float(params["hgb_weight"]), hgb_model),
         (float(params["logreg_weight"]), logreg_model),
     ]
+
+    et_weight = float(params.get("et_weight", 0.0))
+    if et_weight > 0.0:
+        et_model = build_extratrees_model(
+            X,
+            n_estimators=int(params.get("et_n_estimators", 520)),
+            max_depth=int(params.get("et_max_depth", 18)),
+            min_samples_leaf=int(params.get("et_min_samples_leaf", 3)),
+            max_features=str(params.get("et_max_features", "sqrt")),
+            random_state=int(params.get("et_seed", 42)),
+        )
+        weighted.append((et_weight, et_model))
+
+    return weighted
 
 
 def evaluate_candidate_config(
