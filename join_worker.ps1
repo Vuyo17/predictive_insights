@@ -208,6 +208,15 @@ function Resolve-ControllerUrl {
   return $manual.Trim()
 }
 
+function Normalize-ServiceExitCode {
+  param([int]$Code)
+  if ($Code -eq 0) { return 0 }
+  if ($Code -eq -1 -or $Code -eq -1073741510 -or $Code -eq 3221225786) {
+    return 0
+  }
+  return $Code
+}
+
 try {
   Write-Host 'Starting worker setup...'
   Ensure-RepoShape
@@ -248,7 +257,13 @@ try {
   }
 
   Write-Host "Launching worker against $resolvedUrl ..."
-  Invoke-Checked -FilePath $venvPython -Arguments @((Join-Path $ScriptRoot 'src\distributed_worker.py'), '--controller-url', $resolvedUrl) -StepName 'worker startup'
+  & $venvPython (Join-Path $ScriptRoot 'src\distributed_worker.py') --controller-url $resolvedUrl
+  $workerExit = Normalize-ServiceExitCode -Code $LASTEXITCODE
+  if ($workerExit -eq 0) {
+    Write-Host 'Worker stopped.'
+    exit 0
+  }
+  throw "worker startup failed with exit code $workerExit."
 }
 catch {
   Write-Host ''

@@ -139,6 +139,15 @@ function Test-ControllerAlreadyRunning {
   throw "Port 8765 is already in use by PID $($conn.OwningProcess)."
 }
 
+function Normalize-ServiceExitCode {
+  param([int]$Code)
+  if ($Code -eq 0) { return 0 }
+  if ($Code -eq -1 -or $Code -eq -1073741510 -or $Code -eq 3221225786) {
+    return 0
+  }
+  return $Code
+}
+
 try {
   Write-Host 'Starting distributed controller setup...'
   Ensure-RepoShape
@@ -182,7 +191,13 @@ try {
   }
 
   Write-Host 'Launching controller...'
-  Invoke-Checked -FilePath $venvPython -Arguments @((Join-Path $ScriptRoot 'src\distributed_controller.py'), '--host', '0.0.0.0', '--port', '8765', '--discovery-port', '50555') -StepName 'controller startup'
+  & $venvPython (Join-Path $ScriptRoot 'src\distributed_controller.py') --host 0.0.0.0 --port 8765 --discovery-port 50555
+  $controllerExit = Normalize-ServiceExitCode -Code $LASTEXITCODE
+  if ($controllerExit -eq 0) {
+    Write-Host 'Controller stopped.'
+    exit 0
+  }
+  throw "controller startup failed with exit code $controllerExit."
 }
 catch {
   Write-Host ''
