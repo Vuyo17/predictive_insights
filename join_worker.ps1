@@ -7,6 +7,19 @@ $ErrorActionPreference = 'Stop'
 $ScriptRoot = Split-Path -Parent $PSCommandPath
 Set-Location $ScriptRoot
 
+function Invoke-Checked {
+  param(
+    [string]$FilePath,
+    [string[]]$Arguments,
+    [string]$StepName
+  )
+
+  & $FilePath @Arguments
+  if ($LASTEXITCODE -ne 0) {
+    throw "$StepName failed with exit code $LASTEXITCODE."
+  }
+}
+
 function Resolve-VenvPythonPath {
   $candidates = @(
     (Join-Path $ScriptRoot ".venv\Scripts\python.exe"),
@@ -49,8 +62,15 @@ function Ensure-Python {
 
   if ($hasPython) {
     try {
-      & python -c "import sys" *> $null
-      $pythonReady = ($LASTEXITCODE -eq 0)
+      $ver = & python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
+      if ($LASTEXITCODE -eq 0) {
+        $parts = ($ver.Trim() -split '\\.')
+        if ($parts.Length -ge 2) {
+          $major = [int]$parts[0]
+          $minor = [int]$parts[1]
+          $pythonReady = ($major -gt 3) -or ($major -eq 3 -and $minor -ge 12)
+        }
+      }
     } catch {
       $pythonReady = $false
     }
@@ -65,6 +85,9 @@ function Ensure-Python {
   }
 
   winget install -e --id Python.Python.3.12 --accept-source-agreements --accept-package-agreements
+  if ($LASTEXITCODE -ne 0) {
+    throw 'Automatic Python install failed. Install Python 3.12 manually, open a new terminal, then rerun join_worker.ps1.'
+  }
 
   # PATH updates may require a new shell.
   $postHasPy = [bool](Get-Command py -ErrorAction SilentlyContinue)
@@ -77,8 +100,15 @@ function Ensure-Python {
   }
   if ($postHasPython) {
     try {
-      & python -c "import sys" *> $null
-      if ($LASTEXITCODE -eq 0) { return 'python' }
+      $ver = & python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
+      if ($LASTEXITCODE -eq 0) {
+        $parts = ($ver.Trim() -split '\\.')
+        if ($parts.Length -ge 2) {
+          $major = [int]$parts[0]
+          $minor = [int]$parts[1]
+          if (($major -gt 3) -or ($major -eq 3 -and $minor -ge 12)) { return 'python' }
+        }
+      }
     } catch {}
   }
 
@@ -94,9 +124,15 @@ try {
   if (-not $venvPython) {
     Write-Host 'Creating virtual environment (.venv)...'
     if ($bootstrap -eq 'py') {
-      py -3.12 -m venv (Join-Path $ScriptRoot '.venv')
+      & py -3.12 -m venv (Join-Path $ScriptRoot '.venv')
+      if ($LASTEXITCODE -ne 0) {
+        throw 'Failed to create virtual environment with py -3.12.'
+      }
     } else {
-      python -m venv (Join-Path $ScriptRoot '.venv')
+      & python -m venv (Join-Path $ScriptRoot '.venv')
+      if ($LASTEXITCODE -ne 0) {
+        throw 'Failed to create virtual environment with python -m venv.'
+      }
     }
     $venvPython = Resolve-VenvPythonPath
     if (-not $venvPython) {
@@ -105,16 +141,16 @@ try {
   }
 
   Write-Host 'Installing dependencies...'
-  & $venvPython -m pip install --upgrade pip
-  & $venvPython -m pip install -r (Join-Path $ScriptRoot 'requirements.txt')
+  Invoke-Checked -FilePath $venvPython -Arguments @('-m', 'pip', 'install', '--upgrade', 'pip') -StepName 'pip self-upgrade'
+  Invoke-Checked -FilePath $venvPython -Arguments @('-m', 'pip', 'install', '-r', (Join-Path $ScriptRoot 'requirements.txt')) -StepName 'requirements install'
 
   Write-Host 'Launching worker...'
   if ([string]::IsNullOrWhiteSpace($ControllerUrl)) {
     # Auto-discover controller on LAN and join.
-    & $venvPython (Join-Path $ScriptRoot 'src\distributed_worker.py')
+    Invoke-Checked -FilePath $venvPython -Arguments @((Join-Path $ScriptRoot 'src\distributed_worker.py')) -StepName 'worker startup'
   } else {
     # Direct connect fallback when LAN discovery is blocked.
-    & $venvPython (Join-Path $ScriptRoot 'src\distributed_worker.py') --controller-url $ControllerUrl
+    Invoke-Checked -FilePath $venvPython -Arguments @((Join-Path $ScriptRoot 'src\distributed_worker.py'), '--controller-url', $ControllerUrl) -StepName 'worker startup'
   }
 }
 catch {
