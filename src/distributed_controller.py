@@ -82,6 +82,26 @@ class ControllerState:
 STATE = ControllerState()
 
 
+def resolve_lan_ip() -> str:
+    """Resolve a likely LAN IP for sharing the controller URL."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # No outbound packet is sent; this picks the local interface.
+        probe.connect(("8.8.8.8", 80))
+        return str(probe.getsockname()[0])
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        probe.close()
+
+
+def resolve_advertised_host(bind_host: str) -> str:
+    host = (bind_host or "").strip()
+    if host in {"", "0.0.0.0", "::"}:
+        return resolve_lan_ip()
+    return host
+
+
 def load_benchmark_state(path: Path) -> Dict[str, Any]:
     if not path.exists():
         return {}
@@ -445,7 +465,9 @@ def run_controller(args: argparse.Namespace) -> None:
     producer = threading.Thread(target=job_producer_loop, daemon=True)
     producer.start()
 
-    controller_url = f"http://{args.host}:{args.port}"
+    bind_url = f"http://{args.host}:{args.port}"
+    share_host = resolve_advertised_host(args.host)
+    controller_url = f"http://{share_host}:{args.port}"
     discover_thread = threading.Thread(
         target=udp_discovery_loop,
         args=(args.discovery_host, args.discovery_port, controller_url),
@@ -454,8 +476,11 @@ def run_controller(args: argparse.Namespace) -> None:
     discover_thread.start()
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(f"Controller listening at {controller_url}")
-    print(f"Dashboard: {controller_url}/dashboard")
+    print(f"Controller bind: {bind_url}")
+    print(f"Controller URL: {controller_url}")
+    print(f"Dashboard (local): http://127.0.0.1:{args.port}/dashboard")
+    if share_host != "127.0.0.1":
+        print(f"Dashboard (LAN): {controller_url}/dashboard")
     print(f"UDP discovery on {args.discovery_host}:{args.discovery_port}")
     print("Press Ctrl+C to stop.")
     try:
