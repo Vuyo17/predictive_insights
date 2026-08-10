@@ -74,7 +74,7 @@ This does the following automatically:
 Clone the same repo and run one command:
 
 ```powershell
-.\join_worker.ps1
+.\join_worker.cmd
 ```
 
 This script:
@@ -82,6 +82,12 @@ This script:
 - creates `.venv` and installs dependencies
 - auto-discovers your controller over LAN
 - registers worker and starts contributing compute jobs
+
+If auto-discovery is blocked, use the same single command with your host URL:
+
+```powershell
+.\join_worker.cmd http://<controller-ip>:8765
+```
 
 ### Dashboard
 

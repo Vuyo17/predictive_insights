@@ -1,6 +1,6 @@
 @echo off
 setlocal
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0join_worker.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0join_worker.ps1" %*
 set EXITCODE=%ERRORLEVEL%
 if not "%EXITCODE%"=="0" (
   echo.

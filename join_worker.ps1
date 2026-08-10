@@ -1,3 +1,8 @@
+$ControllerUrl = ""
+if ($args.Count -gt 0) {
+  $ControllerUrl = [string]$args[0]
+}
+
 $ErrorActionPreference = 'Stop'
 
 function Ensure-RepoShape {
@@ -34,7 +39,8 @@ function Ensure-Python {
     }
   }
 
-  if ($pyReady -or $pythonReady) { return }
+  if ($pyReady) { return 'py' }
+  if ($pythonReady) { return 'python' }
 
   Write-Host 'Python 3.12+ runtime not found. Attempting install via winget...'
   if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
@@ -49,13 +55,13 @@ function Ensure-Python {
   if ($postHasPy) {
     try {
       & py -3.12 -c "import sys" *> $null
-      if ($LASTEXITCODE -eq 0) { return }
+      if ($LASTEXITCODE -eq 0) { return 'py' }
     } catch {}
   }
   if ($postHasPython) {
     try {
       & python -c "import sys" *> $null
-      if ($LASTEXITCODE -eq 0) { return }
+      if ($LASTEXITCODE -eq 0) { return 'python' }
     } catch {}
   }
 
@@ -65,11 +71,11 @@ function Ensure-Python {
 try {
   Write-Host 'Starting worker setup...'
   Ensure-RepoShape
-  Ensure-Python
+  $bootstrap = Ensure-Python
 
   if (-not (Test-Path .\.venv\Scripts\python.exe)) {
     Write-Host 'Creating virtual environment (.venv)...'
-    if (Get-Command py -ErrorAction SilentlyContinue) {
+    if ($bootstrap -eq 'py') {
       py -3.12 -m venv .venv
     } else {
       python -m venv .venv
@@ -81,8 +87,13 @@ try {
   .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 
   Write-Host 'Launching worker...'
-  # Auto-discover controller on LAN and join.
-  .\.venv\Scripts\python.exe .\src\distributed_worker.py
+  if ([string]::IsNullOrWhiteSpace($ControllerUrl)) {
+    # Auto-discover controller on LAN and join.
+    .\.venv\Scripts\python.exe .\src\distributed_worker.py
+  } else {
+    # Direct connect fallback when LAN discovery is blocked.
+    .\.venv\Scripts\python.exe .\src\distributed_worker.py --controller-url $ControllerUrl
+  }
 }
 catch {
   Write-Host ''
