@@ -10,15 +10,56 @@ function Ensure-RepoShape {
 }
 
 function Ensure-Python {
-  if (Get-Command py -ErrorAction SilentlyContinue) { return }
-  if (Get-Command python -ErrorAction SilentlyContinue) { return }
+  $hasPy = [bool](Get-Command py -ErrorAction SilentlyContinue)
+  $hasPython = [bool](Get-Command python -ErrorAction SilentlyContinue)
 
-  Write-Host 'Python not found. Attempting install via winget...'
+  $pyReady = $false
+  $pythonReady = $false
+
+  if ($hasPy) {
+    try {
+      & py -3.12 -c "import sys" *> $null
+      $pyReady = ($LASTEXITCODE -eq 0)
+    } catch {
+      $pyReady = $false
+    }
+  }
+
+  if ($hasPython) {
+    try {
+      & python -c "import sys" *> $null
+      $pythonReady = ($LASTEXITCODE -eq 0)
+    } catch {
+      $pythonReady = $false
+    }
+  }
+
+  if ($pyReady -or $pythonReady) { return }
+
+  Write-Host 'Python 3.12+ runtime not found. Attempting install via winget...'
   if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-    throw 'winget is not installed. Please install Python 3.12 manually, then rerun join_worker.ps1.'
+    throw 'winget is not installed. Install Python 3.12 manually, open a new terminal, then rerun join_worker.ps1.'
   }
 
   winget install -e --id Python.Python.3.12 --accept-source-agreements --accept-package-agreements
+
+  # PATH updates may require a new shell.
+  $postHasPy = [bool](Get-Command py -ErrorAction SilentlyContinue)
+  $postHasPython = [bool](Get-Command python -ErrorAction SilentlyContinue)
+  if ($postHasPy) {
+    try {
+      & py -3.12 -c "import sys" *> $null
+      if ($LASTEXITCODE -eq 0) { return }
+    } catch {}
+  }
+  if ($postHasPython) {
+    try {
+      & python -c "import sys" *> $null
+      if ($LASTEXITCODE -eq 0) { return }
+    } catch {}
+  }
+
+  throw 'Python was installed, but this shell cannot see it yet. Close this terminal, open a new one, and rerun join_worker.ps1.'
 }
 
 try {

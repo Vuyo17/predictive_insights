@@ -1,9 +1,39 @@
 $ErrorActionPreference = 'Stop'
 
-function Get-PythonBootstrapCommand {
-  if (Get-Command py -ErrorAction SilentlyContinue) { return 'py -3.12' }
-  if (Get-Command python -ErrorAction SilentlyContinue) { return 'python' }
-  return $null
+function Test-PythonRuntime {
+  param([string]$Command)
+
+  try {
+    if ($Command -eq 'py') {
+      & py -3.12 -c "import sys" *> $null
+    } else {
+      & python -c "import sys" *> $null
+    }
+    return ($LASTEXITCODE -eq 0)
+  } catch {
+    return $false
+  }
+}
+
+function Ensure-Python {
+  $hasPy = [bool](Get-Command py -ErrorAction SilentlyContinue)
+  $hasPython = [bool](Get-Command python -ErrorAction SilentlyContinue)
+
+  if ($hasPy -and (Test-PythonRuntime 'py')) { return 'py' }
+  if ($hasPython -and (Test-PythonRuntime 'python')) { return 'python' }
+
+  Write-Host 'Python 3.12+ runtime not found. Attempting install via winget...'
+  if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+    throw 'winget is not installed. Install Python 3.12 manually, open a new terminal, then rerun start_controller.ps1.'
+  }
+
+  winget install -e --id Python.Python.3.12 --accept-source-agreements --accept-package-agreements
+
+  # PATH updates may require a new shell. Try immediate detection first.
+  if ([bool](Get-Command py -ErrorAction SilentlyContinue) -and (Test-PythonRuntime 'py')) { return 'py' }
+  if ([bool](Get-Command python -ErrorAction SilentlyContinue) -and (Test-PythonRuntime 'python')) { return 'python' }
+
+  throw 'Python was installed, but this shell cannot see it yet. Close this terminal, open a new one, and rerun start_controller.ps1.'
 }
 
 function Ensure-RepoShape {
@@ -20,12 +50,15 @@ try {
   Ensure-RepoShape
 
   if (-not (Test-Path .\.venv\Scripts\python.exe)) {
-    $bootstrap = Get-PythonBootstrapCommand
-    if (-not $bootstrap) {
-      throw 'Python not found. Install Python 3.12+ and rerun start_controller.ps1.'
-    }
+    $bootstrap = Ensure-Python
     Write-Host 'Creating virtual environment (.venv)...'
-    Invoke-Expression "$bootstrap -m venv .venv"
+    if ($bootstrap -eq 'py') {
+      & py -3.12 -m venv .venv
+    } else {
+      & python -m venv .venv
+    }
+  } else {
+    Ensure-Python | Out-Null
   }
 
   Write-Host 'Installing dependencies...'
