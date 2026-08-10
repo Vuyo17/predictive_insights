@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
 .venv/
+.env
+.improver_state.json
 outputs/*.csv
 outputs/*.json
 outputs/*.joblib

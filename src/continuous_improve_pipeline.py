@@ -5,7 +5,7 @@ import hashlib
 import json
 import os
 import random
-import time
+import re
 from glob import glob
 from datetime import datetime
 from pathlib import Path
@@ -23,14 +23,222 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder
 
-from train_and_submit import (
-    auto_find_data_paths,
-    build_panel_features,
-    infer_id_col,
-    infer_target_col,
-    load_table,
-    maybe_to_wide_panel,
-)
+
+ROUND_PATTERNS = [
+    re.compile(r"(?i)(?:^|[_-])(r|round|wave)(\d{1,2})(?:$|[_-])"),
+    re.compile(r"(?i)(\d{1,2})$"),
+]
+
+
+def load_table(path: Path) -> pd.DataFrame:
+    if path.suffix.lower() == ".csv":
+        return pd.read_csv(path)
+    if path.suffix.lower() in {".parquet", ".pq"}:
+        return pd.read_parquet(path)
+    raise ValueError(f"Unsupported file format: {path}")
+
+
+def auto_find_data_paths(data_dir: Path) -> Tuple[Path, Path]:
+    candidates = sorted(data_dir.glob("*"))
+    train_candidates = [p for p in candidates if p.is_file() and "train" in p.stem.lower()]
+    test_candidates = [p for p in candidates if p.is_file() and "test" in p.stem.lower()]
+
+    if not train_candidates or not test_candidates:
+        raise FileNotFoundError(
+            "Could not auto-detect train/test files in data/. "
+            "Name files with 'train' and 'test' in the filename (csv/parquet)."
+        )
+
+    return train_candidates[0], test_candidates[0]
+
+
+def infer_id_col(df: pd.DataFrame) -> str:
+    candidates = [
+        "anonymised_id",
+        "anonymous_id",
+        "participant_id",
+        "person_id",
+        "id",
+    ]
+    lower_to_original = {c.lower(): c for c in df.columns}
+    for candidate in candidates:
+        if candidate in lower_to_original:
+            return lower_to_original[candidate]
+
+    string_cols = [c for c in df.columns if df[c].dtype == "object" or pd.api.types.is_string_dtype(df[c])]
+    if string_cols:
+        uniq_ratio = [(c, df[c].nunique(dropna=True) / max(len(df), 1)) for c in string_cols]
+        uniq_ratio.sort(key=lambda x: x[1], reverse=True)
+        return uniq_ratio[0][0]
+
+    return df.columns[0]
+
+
+def infer_target_col(df: pd.DataFrame) -> str:
+    candidates = [
+        "employed_status",
+        "target",
+        "label",
+        "y",
+    ]
+    lower_to_original = {c.lower(): c for c in df.columns}
+    for candidate in candidates:
+        if candidate in lower_to_original:
+            return lower_to_original[candidate]
+    raise ValueError("Could not infer target column. Expected something like employed_status.")
+
+
+def maybe_to_wide_panel(df: pd.DataFrame, id_col: str, target_col: Optional[str]) -> pd.DataFrame:
+    lower_map = {c.lower(): c for c in df.columns}
+    round_col = None
+    for name in ["round", "survey_round", "wave"]:
+        if name in lower_map:
+            round_col = lower_map[name]
+            break
+
+    if round_col is None:
+        return df
+
+    if not df[id_col].duplicated().any():
+        return df
+
+    work = df.copy()
+    work[round_col] = pd.to_numeric(work[round_col], errors="coerce")
+
+    keep_cols = [c for c in work.columns if c not in {id_col, round_col, target_col}]
+
+    wide_parts: List[pd.DataFrame] = []
+    for col in keep_cols:
+        pivot = work.pivot_table(index=id_col, columns=round_col, values=col, aggfunc="first")
+        pivot.columns = [f"{col}_r{int(c)}" for c in pivot.columns]
+        wide_parts.append(pivot)
+
+    wide = pd.concat(wide_parts, axis=1).reset_index()
+
+    if target_col is not None and target_col in work.columns:
+        target = work.groupby(id_col, as_index=False)[target_col].max()
+        wide = wide.merge(target, on=id_col, how="left")
+
+    return wide
+
+
+def detect_round_number(col_name: str, max_round: int) -> Optional[int]:
+    for pattern in ROUND_PATTERNS:
+        match = pattern.search(col_name)
+        if match:
+            value = int(match.group(2) if len(match.groups()) > 1 else match.group(1))
+            if 1 <= value <= max_round:
+                return value
+    return None
+
+
+def normalize_base_name(col_name: str) -> str:
+    base = re.sub(r"(?i)(?:^|[_-])(r|round|wave)\d{1,2}(?:$|[_-])", "_", col_name)
+    base = re.sub(r"\d{1,2}$", "", base)
+    base = re.sub(r"__+", "_", base).strip("_-")
+    return base if base else col_name
+
+
+def row_slope(values: np.ndarray, rounds: np.ndarray) -> float:
+    mask = ~np.isnan(values)
+    if mask.sum() < 2:
+        return np.nan
+    x = rounds[mask]
+    y = values[mask]
+    return float(np.polyfit(x, y, 1)[0])
+
+
+def build_panel_features(
+    df: pd.DataFrame,
+    id_col: str,
+    target_col: Optional[str],
+    max_round: int,
+) -> Tuple[pd.DataFrame, Optional[pd.Series]]:
+    work = df.copy()
+    y: Optional[pd.Series] = None
+    if target_col is not None and target_col in work.columns:
+        y = pd.to_numeric(work[target_col], errors="coerce")
+        work = work.drop(columns=[target_col])
+
+    cols = [c for c in work.columns if c != id_col]
+
+    round_groups: Dict[str, Dict[int, str]] = {}
+    static_cols: List[str] = []
+
+    for col in cols:
+        round_num = detect_round_number(col, max_round)
+        if round_num is None:
+            static_cols.append(col)
+            continue
+        base = normalize_base_name(col)
+        round_groups.setdefault(base, {})[round_num] = col
+
+    features = pd.DataFrame(index=work.index)
+    features[id_col] = work[id_col]
+
+    if static_cols:
+        static_block = work[static_cols].copy()
+        if not static_block.empty:
+            features = pd.concat([features, static_block], axis=1)
+
+    all_round_columns: List[Tuple[int, str]] = []
+
+    for base, mapping in round_groups.items():
+        rounds_sorted = np.array(sorted(mapping.keys()), dtype=float)
+        col_order = [mapping[r] for r in sorted(mapping.keys())]
+        series_block = work[col_order]
+
+        all_round_columns.extend((r, mapping[r]) for r in mapping)
+
+        numeric_block = series_block.apply(pd.to_numeric, errors="coerce")
+        numeric_share = float(np.isfinite(numeric_block.to_numpy(dtype=float)).mean())
+        is_numeric = numeric_share >= 0.5
+
+        if is_numeric:
+            vals = numeric_block
+            last_vals = vals.ffill(axis=1).iloc[:, -1]
+            first_vals = vals.bfill(axis=1).iloc[:, 0]
+
+            features[f"{base}__last"] = last_vals
+            features[f"{base}__first"] = first_vals
+            features[f"{base}__change"] = last_vals - first_vals
+            features[f"{base}__mean"] = vals.mean(axis=1)
+            features[f"{base}__std"] = vals.std(axis=1)
+            features[f"{base}__min"] = vals.min(axis=1)
+            features[f"{base}__max"] = vals.max(axis=1)
+            features[f"{base}__obs_count"] = vals.notna().sum(axis=1)
+
+            arr = vals.to_numpy(dtype=float)
+            slopes = np.array([row_slope(row, rounds_sorted) for row in arr])
+            features[f"{base}__trend"] = slopes
+        else:
+            cats = series_block.astype("string")
+            last_vals = cats.ffill(axis=1).iloc[:, -1]
+            first_vals = cats.bfill(axis=1).iloc[:, 0]
+
+            features[f"{base}__last"] = last_vals
+            features[f"{base}__first"] = first_vals
+            features[f"{base}__mode"] = cats.mode(axis=1, dropna=True).iloc[:, 0]
+            features[f"{base}__nunique"] = cats.nunique(axis=1, dropna=True)
+            features[f"{base}__changed"] = (
+                (last_vals.fillna("<NA>") != first_vals.fillna("<NA>")).astype(float)
+            )
+
+    if all_round_columns:
+        round_frame = pd.DataFrame(
+            {
+                col_name: work[col_name].notna().astype(int) * round_num
+                for round_num, col_name in all_round_columns
+            }
+        )
+        features["panel__most_recent_round"] = round_frame.max(axis=1)
+        min_round = round_frame.replace(0, np.nan).min(axis=1)
+        features["panel__first_observed_round"] = min_round
+        features["panel__history_span"] = (
+            features["panel__most_recent_round"] - features["panel__first_observed_round"]
+        )
+
+    return features, y
 
 
 def split_columns(X: pd.DataFrame) -> Tuple[List[str], List[str]]:
@@ -109,7 +317,7 @@ def build_logreg_model(
                         ("imputer", SimpleImputer(strategy="most_frequent")),
                         (
                             "encoder",
-                            OneHotEncoder(handle_unknown="ignore", min_frequency=15),
+                            OneHotEncoder(handle_unknown="ignore", min_frequency=25),
                         ),
                     ]
                 ),
@@ -123,6 +331,7 @@ def build_logreg_model(
         C=c_value,
         max_iter=max_iter,
         solver="saga",
+        tol=3e-3,
         class_weight=class_weight,
         random_state=random_state,
     )
@@ -212,7 +421,7 @@ def sample_candidate(
         }
         logreg_params = {
             "c": perturb_float(rng, float(best_params.get("logreg_c", 1.0)), 0.18, 0.35, 1.8),
-            "max_iter": perturb_int(rng, int(best_params.get("logreg_max_iter", 3200)), 300, 2200, 6000),
+            "max_iter": perturb_int(rng, int(best_params.get("logreg_max_iter", 1500)), 180, 900, 2600),
             "seed": int(rng.randint(1, 10_000_000)),
         }
         hgb_weight = round(
@@ -231,7 +440,7 @@ def sample_candidate(
         }
         logreg_params = {
             "c": round(rng.uniform(0.5, 1.6), 6),
-            "max_iter": int(rng.randint(2600, 5200)),
+            "max_iter": int(rng.randint(900, 2200)),
             "seed": int(rng.randint(1, 10_000_000)),
         }
         hgb_weight = round(rng.uniform(0.55, 0.8), 4)
@@ -404,31 +613,52 @@ def fit_predict_full(
     return np.clip(pred, 0.0, 1.0)
 
 
+def next_submission_index(output_dir: Path) -> int:
+    highest = 0
+    for file_path in output_dir.glob("submission*.csv"):
+        match = re.fullmatch(r"submission(\d+)\.csv", file_path.name)
+        if match:
+            highest = max(highest, int(match.group(1)))
+    return highest + 1
+
+
+def load_benchmark_state(path: Path) -> Dict[str, float | int]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            result: Dict[str, float | int] = {}
+            best = payload.get("best_cv_auc")
+            idx = payload.get("last_submission_index")
+            if isinstance(best, (int, float)):
+                result["best_cv_auc"] = float(best)
+            if isinstance(idx, int):
+                result["last_submission_index"] = idx
+            return result
+    except (json.JSONDecodeError, OSError):
+        pass
+    return {}
+
+
+def save_benchmark_state(path: Path, best_cv_auc: float, last_submission_index: int) -> None:
+    payload = {
+        "updated_at": datetime.now().isoformat(),
+        "best_cv_auc": float(best_cv_auc),
+        "last_submission_index": int(last_submission_index),
+    }
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
 def save_improved_submission(
     output_dir: Path,
-    iteration: int,
-    candidate_name: str,
-    worker_name: str,
-    mean_auc: float,
-    fold_scores: List[float],
-    params: Dict[str, float],
-    train_ids: pd.Series,
-    y: pd.Series,
-    oof: np.ndarray,
+    submission_index: int,
     test_ids: pd.Series,
     test_pred: np.ndarray,
-    baseline_before: float,
-    prediction_hash: str,
 ) -> Dict[str, str]:
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    worker_suffix = f"_{worker_name}" if worker_name else ""
-    stem = f"cont_{candidate_name}{worker_suffix}_iter{iteration}_{ts}"
-
-    submission_path = output_dir / f"submission_{stem}.csv"
-    oof_path = output_dir / f"oof_{stem}.csv"
-    report_path = output_dir / f"continuous_report_{stem}.json"
+    submission_path = output_dir / f"submission{submission_index}.csv"
 
     pd.DataFrame(
         {
@@ -437,167 +667,14 @@ def save_improved_submission(
         }
     ).to_csv(submission_path, index=False)
 
-    pd.DataFrame(
-        {
-            "anonymised_id": train_ids,
-            "target": y.values,
-            "oof_pred": oof,
-        }
-    ).to_csv(oof_path, index=False)
-
-    report = {
-        "status": "improvement_found",
-        "iteration": iteration,
-        "candidate_name": candidate_name,
-        "params": params,
-        "baseline_before": baseline_before,
-        "cv_auc_mean": mean_auc,
-        "cv_auc_gain": mean_auc - baseline_before,
-        "prediction_hash": prediction_hash,
-        "fold_scores": fold_scores,
-        "timestamp": datetime.now().isoformat(),
-        "artifacts": {
-            "submission": str(submission_path),
-            "oof": str(oof_path),
-        },
-    }
-    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
-
     return {
         "submission_path": str(submission_path),
-        "oof_path": str(oof_path),
-        "report_path": str(report_path),
     }
-
-
-def read_best_manual_score(score_file: Path) -> Optional[float]:
-    if not score_file.exists():
-        return None
-
-    try:
-        payload = json.loads(score_file.read_text(encoding="utf-8"))
-        scores = payload.get("scores", {})
-        values = [float(v) for v in scores.values() if isinstance(v, (int, float))]
-        return max(values) if values else None
-    except (json.JSONDecodeError, OSError, ValueError):
-        return None
 
 
 def prediction_hash(values: np.ndarray) -> str:
     rounded = np.round(values.astype(float), 12)
     return hashlib.sha1(rounded.tobytes()).hexdigest()
-
-
-def candidate_signature(candidate_name: str, params: Dict[str, float]) -> str:
-    normalized: Dict[str, object] = {}
-    for key, value in sorted(params.items()):
-        if isinstance(value, float):
-            normalized[key] = round(value, 12)
-        elif isinstance(value, (int, str, bool)) or value is None:
-            normalized[key] = value
-        else:
-            normalized[key] = str(value)
-
-    payload = {
-        "candidate_name": candidate_name,
-        "params": normalized,
-    }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha1(encoded).hexdigest()
-
-
-def load_json_or_default(path: Path, default: Dict[str, object]) -> Dict[str, object]:
-    if not path.exists():
-        return dict(default)
-
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(payload, dict):
-            return payload
-    except (json.JSONDecodeError, OSError):
-        pass
-
-    return dict(default)
-
-
-def write_json_atomic(path: Path, payload: Dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(f"{path.suffix}.tmp")
-    tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    tmp_path.replace(path)
-
-
-def acquire_lock_file(lock_path: Path, timeout_seconds: float = 10.0, stale_seconds: float = 180.0) -> bool:
-    deadline = time.time() + timeout_seconds
-
-    while time.time() < deadline:
-        try:
-            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(datetime.now().isoformat())
-            return True
-        except FileExistsError:
-            try:
-                age_seconds = time.time() - lock_path.stat().st_mtime
-                if age_seconds > stale_seconds:
-                    lock_path.unlink(missing_ok=True)
-                    continue
-            except OSError:
-                pass
-
-            time.sleep(0.05)
-
-    return False
-
-
-def release_lock_file(lock_path: Path) -> None:
-    try:
-        lock_path.unlink(missing_ok=True)
-    except OSError:
-        pass
-
-
-def claim_candidate_signature(
-    coordination_file: Path,
-    signature: str,
-    worker_name: str,
-    ttl_seconds: float,
-) -> Tuple[bool, Optional[str]]:
-    lock_path = coordination_file.with_suffix(".lock")
-    lock_acquired = acquire_lock_file(lock_path)
-    if not lock_acquired:
-        return False, "lock-timeout"
-
-    try:
-        now = datetime.now()
-        state = load_json_or_default(coordination_file, {"version": 1, "claims": {}})
-        raw_claims = state.get("claims", {})
-        claims = raw_claims if isinstance(raw_claims, dict) else {}
-
-        existing = claims.get(signature)
-        if isinstance(existing, dict):
-            claimed_at = existing.get("claimed_at")
-            if isinstance(claimed_at, str):
-                try:
-                    age = (now - datetime.fromisoformat(claimed_at)).total_seconds()
-                    if age < ttl_seconds:
-                        owner = existing.get("worker_name")
-                        owner_name = str(owner) if owner is not None else "unknown"
-                        return False, owner_name
-                except ValueError:
-                    pass
-
-        claims[signature] = {
-            "worker_name": worker_name,
-            "claimed_at": now.isoformat(),
-        }
-
-        state["claims"] = claims
-        state["updated_at"] = now.isoformat()
-        write_json_atomic(coordination_file, state)
-        return True, None
-    finally:
-        release_lock_file(lock_path)
 
 
 def load_existing_prediction_hashes(output_dir: Path) -> set[str]:
@@ -615,10 +692,6 @@ def get_initial_baseline(args: argparse.Namespace) -> float:
     if args.baseline_override is not None:
         return float(args.baseline_override)
 
-    manual_best = read_best_manual_score(args.leaderboard_scores_file)
-    if manual_best is not None:
-        return manual_best
-
     if args.baseline_metrics_file.exists():
         try:
             payload = json.loads(args.baseline_metrics_file.read_text(encoding="utf-8"))
@@ -629,11 +702,6 @@ def get_initial_baseline(args: argparse.Namespace) -> float:
             pass
 
     return float(args.fallback_baseline)
-
-
-def save_state(state_path: Path, payload: Dict[str, object]) -> None:
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def parse_args() -> argparse.Namespace:
@@ -657,6 +725,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--max-iterations", type=int, default=0, help="0 means run forever")
+    parser.add_argument(
+        "--target-improvements",
+        type=int,
+        default=0,
+        help="Stop after writing this many improved submission files (0 means unlimited).",
+    )
     parser.add_argument("--batch-size", type=int, default=4, help="Candidates to screen per loop")
     parser.add_argument(
         "--parallel-jobs",
@@ -664,43 +738,7 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Parallel candidate evaluations per batch. 0 uses cpu_count-1, -1 uses all CPUs.",
     )
-    parser.add_argument(
-        "--worker-name",
-        type=str,
-        default="",
-        help="Optional worker/server name added to output files and state for multi-server runs.",
-    )
-    parser.add_argument(
-        "--server-count",
-        type=int,
-        default=1,
-        help="Number of cooperating servers. Values >1 enable deterministic divide-and-conquer sharding.",
-    )
-    parser.add_argument(
-        "--server-index",
-        type=int,
-        default=0,
-        help="0-based shard index for this server. Must be in [0, server-count-1].",
-    )
     parser.add_argument("--output-dir", type=Path, default=Path("outputs"), help="Output directory")
-    parser.add_argument(
-        "--coordination-file",
-        type=Path,
-        default=None,
-        help="Shared JSON file for candidate claims (default: <output-dir>/continuous_coordination.json).",
-    )
-    parser.add_argument(
-        "--claim-ttl-seconds",
-        type=float,
-        default=12 * 3600,
-        help="How long a claimed candidate stays reserved before another server may re-claim it.",
-    )
-    parser.add_argument(
-        "--state-file",
-        type=Path,
-        default=None,
-        help="Optional state file path (default: <output-dir>/continuous_state.json)",
-    )
     parser.add_argument("--fallback-baseline", type=float, default=0.0, help="Fallback baseline if no reference score is found")
     parser.add_argument("--baseline-override", type=float, default=None, help="Explicit initial baseline to beat")
     parser.add_argument(
@@ -710,21 +748,16 @@ def parse_args() -> argparse.Namespace:
         help="Metrics file used as baseline fallback",
     )
     parser.add_argument(
-        "--leaderboard-scores-file",
+        "--benchmark-state-file",
         type=Path,
-        default=Path("frontend/src/data/leaderboard_scores.json"),
-        help="Leaderboard score mapping file for real-score baseline",
+        default=Path(".improver_state.json"),
+        help="Persistent local benchmark state file used across runs.",
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-
-    if args.server_count < 1:
-        raise ValueError("--server-count must be >= 1")
-    if args.server_index < 0 or args.server_index >= args.server_count:
-        raise ValueError("--server-index must be within [0, server-count-1]")
 
     if args.train_file is not None and args.test_file is not None:
         train_path = args.train_file
@@ -757,87 +790,62 @@ def main() -> None:
     y = y.fillna(0).astype(int)
 
     baseline = get_initial_baseline(args)
-    worker_slug = args.worker_name.strip().replace(" ", "_")
-    default_state_name = f"continuous_state_{worker_slug}.json" if worker_slug else "continuous_state.json"
-    state_path = args.state_file if args.state_file is not None else (args.output_dir / default_state_name)
-    coordination_file = (
-        args.coordination_file
-        if args.coordination_file is not None
-        else (args.output_dir / "continuous_coordination.json")
-    )
-    coordination_enabled = args.server_count > 1
-    best_cv_auc = baseline
+    benchmark_state = load_benchmark_state(args.benchmark_state_file)
+    persisted_best = float(benchmark_state.get("best_cv_auc", baseline))
+    best_cv_auc = max(baseline, persisted_best)
     best_candidate_meta: Optional[Dict[str, object]] = None
     seen_prediction_hashes = load_existing_prediction_hashes(args.output_dir)
     parallel_jobs = resolve_parallel_jobs(args.parallel_jobs)
+    next_index = next_submission_index(args.output_dir)
+    highest_existing_index = next_index - 1
+
+    if (
+        highest_existing_index > 0
+        and "best_cv_auc" not in benchmark_state
+        and args.baseline_override is None
+    ):
+        raise ValueError(
+            "Found existing numbered submissions but no benchmark state file. "
+            "Run once with --baseline-override <best_cv_auc_so_far> to initialize local benchmark tracking."
+        )
 
     print(f"Continuous pipeline started at {datetime.now().isoformat()}")
     print(f"Initial baseline to beat: {best_cv_auc:.6f}")
     print(f"Parallel jobs: {parallel_jobs} | Batch size: {args.batch_size}")
-    print(f"Server shard: index {args.server_index}/{args.server_count - 1}")
-    if coordination_enabled:
-        print(f"Coordination file: {coordination_file}")
+    print(f"Next submission filename index: {next_index}")
+    if args.target_improvements > 0:
+        print(f"Target improved submissions to write: {args.target_improvements}")
     print("Press Ctrl+C to stop.")
 
     iteration = 0
+    improvements_written = 0
     candidate_counter = 0
-    shard_cursor = args.server_index
     history: List[Dict[str, object]] = []
-
-    save_state(
-        state_path,
-        {
-            "status": "running",
-            "started_at": datetime.now().isoformat(),
-            "updated_at": datetime.now().isoformat(),
-            "initial_baseline": baseline,
-            "current_best_cv_auc": best_cv_auc,
-            "iterations_completed": 0,
-            "history_tail": [],
-        },
-    )
 
     try:
         while True:
             iteration += 1
-            batch_specs: List[Tuple[int, int, str, Dict[str, float], str]] = []
-            skipped_claims = 0
+            batch_specs: List[Tuple[int, int, str, Dict[str, float]]] = []
             max_attempts = max(args.batch_size * 10, 20)
             attempts = 0
 
             while len(batch_specs) < args.batch_size and attempts < max_attempts:
                 attempts += 1
-                global_candidate_id = shard_cursor
-                shard_cursor += args.server_count
+                global_candidate_id = candidate_counter + 1
 
                 candidate_rng = random.Random(args.seed + (global_candidate_id * 104_729))
                 candidate_name, params, _ = sample_candidate(candidate_rng, X_train, best_candidate_meta)
-                signature = candidate_signature(candidate_name, params)
-
-                if coordination_enabled:
-                    worker_label = worker_slug or f"server_{args.server_index}"
-                    claimed, owner = claim_candidate_signature(
-                        coordination_file=coordination_file,
-                        signature=signature,
-                        worker_name=worker_label,
-                        ttl_seconds=args.claim_ttl_seconds,
-                    )
-                    if not claimed:
-                        skipped_claims += 1
-                        continue
 
                 candidate_counter += 1
-                batch_specs.append((candidate_counter, global_candidate_id, candidate_name, params, signature))
+                batch_specs.append((candidate_counter, global_candidate_id, candidate_name, params))
 
             if not batch_specs:
                 print(
-                    f"\nIteration {iteration}: no claimable candidates found after {attempts} attempts. Retrying next loop."
+                    f"\nIteration {iteration}: no candidates found after {attempts} attempts. Retrying next loop."
                 )
                 continue
 
             print(f"\nIteration {iteration}: screening batch of {len(batch_specs)} candidates")
-            if skipped_claims > 0:
-                print(f"  Skipped {skipped_claims} already-claimed candidate(s)")
 
             raw_screen_results = Parallel(n_jobs=parallel_jobs, prefer="processes")(
                 delayed(evaluate_candidate_config)(
@@ -849,22 +857,20 @@ def main() -> None:
                     args.seed + global_candidate_id,
                     False,
                 )
-                for _, global_candidate_id, candidate_name, params, _ in batch_specs
+                for _, global_candidate_id, candidate_name, params in batch_specs
             )
 
             screen_results: List[Dict[str, object]] = []
             for batch_spec, result in zip(batch_specs, raw_screen_results):
-                _, global_candidate_id, _, _, signature = batch_spec
+                _, global_candidate_id, _, _ = batch_spec
                 enriched = dict(result)
                 enriched["global_candidate_id"] = global_candidate_id
-                enriched["candidate_signature"] = signature
                 screen_results.append(enriched)
 
             best_screen = max(screen_results, key=lambda item: float(item["mean_auc"]))
             candidate_name = str(best_screen["candidate_name"])
             params = dict(best_screen["params"])
             global_candidate_id = int(best_screen["global_candidate_id"])
-            signature = str(best_screen["candidate_signature"])
             quick_mean_auc = float(best_screen["mean_auc"])
             quick_std_auc = float(best_screen["std_auc"])
 
@@ -887,12 +893,10 @@ def main() -> None:
                 fold_scores = list(confirm_result["fold_scores"])
                 mean_auc = float(confirm_result["mean_auc"])
                 std_auc = float(confirm_result["std_auc"])
-                oof = np.asarray(confirm_result["oof"], dtype=float)
             else:
                 fold_scores = list(best_screen["fold_scores"])
                 mean_auc = quick_mean_auc
                 std_auc = quick_std_auc
-                oof = np.zeros(len(X_train), dtype=float)
 
             improved = mean_auc >= (best_cv_auc + args.min_improvement)
             print(f"  Mean AUC={mean_auc:.6f} Std={std_auc:.6f} | Best={best_cv_auc:.6f} | Improved={improved}")
@@ -903,7 +907,6 @@ def main() -> None:
                 "parallel_jobs": parallel_jobs,
                 "candidate_name": candidate_name,
                 "global_candidate_id": global_candidate_id,
-                "candidate_signature": signature,
                 "params": params,
                 "quick_mean_auc": quick_mean_auc,
                 "quick_std_auc": quick_std_auc,
@@ -914,7 +917,6 @@ def main() -> None:
                 "best_before": best_cv_auc,
                 "improved": improved,
                 "timestamp": datetime.now().isoformat(),
-                "worker_name": worker_slug,
             }
 
             if improved:
@@ -940,66 +942,39 @@ def main() -> None:
                 else:
                     artifacts = save_improved_submission(
                         output_dir=args.output_dir,
-                        iteration=iteration,
-                        candidate_name=candidate_name,
-                        worker_name=worker_slug,
-                        mean_auc=mean_auc,
-                        fold_scores=fold_scores,
-                        params=params,
-                        train_ids=train_ids,
-                        y=y,
-                        oof=oof,
+                        submission_index=next_index,
                         test_ids=test_ids,
                         test_pred=test_pred,
-                        baseline_before=best_before,
-                        prediction_hash=pred_hash,
                     )
                     seen_prediction_hashes.add(pred_hash)
                     run_info["artifacts"] = artifacts
                     run_info["best_after"] = best_cv_auc
+                    improvements_written += 1
+                    run_info["improvements_written"] = improvements_written
+                    run_info["submission_index"] = next_index
+                    save_benchmark_state(
+                        path=args.benchmark_state_file,
+                        best_cv_auc=best_cv_auc,
+                        last_submission_index=next_index,
+                    )
+                    next_index += 1
                     print(f"  Improvement accepted. New best CV AUC: {best_cv_auc:.6f}")
                     print(f"  New submission: {artifacts['submission_path']}")
 
+                    if args.target_improvements > 0 and improvements_written >= args.target_improvements:
+                        print(
+                            f"Reached target improvements ({improvements_written}/{args.target_improvements}). Stopping."
+                        )
+                        return
+
             history.append(run_info)
-            state_payload = {
-                "status": "running",
-                "started_at": history[0]["timestamp"] if history else datetime.now().isoformat(),
-                "updated_at": datetime.now().isoformat(),
-                "initial_baseline": baseline,
-                "current_best_cv_auc": best_cv_auc,
-                "iterations_completed": iteration,
-                "last_iteration": run_info,
-                "history_tail": history[-30:],
-            }
-            save_state(state_path, state_payload)
 
             if args.max_iterations > 0 and iteration >= args.max_iterations:
                 print("Max iterations reached. Stopping.")
                 break
 
-        save_state(
-            state_path,
-            {
-                "status": "completed",
-                "updated_at": datetime.now().isoformat(),
-                "initial_baseline": baseline,
-                "current_best_cv_auc": best_cv_auc,
-                "iterations_completed": iteration,
-                "history_tail": history[-30:],
-            },
-        )
-
     except KeyboardInterrupt:
         print("\nStopped by user.")
-        state_payload = {
-            "status": "stopped",
-            "updated_at": datetime.now().isoformat(),
-            "initial_baseline": baseline,
-            "current_best_cv_auc": best_cv_auc,
-            "iterations_completed": iteration,
-            "history_tail": history[-30:],
-        }
-        save_state(state_path, state_payload)
 
 
 if __name__ == "__main__":
