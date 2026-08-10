@@ -120,7 +120,16 @@ def run_worker(args: argparse.Namespace) -> None:
             if accepted:
                 print(f"[{jobs_done}] Accepted: new file {submit_res.get('file')} | best={submit_res.get('new_best'):.6f}")
             else:
-                print(f"[{jobs_done}] Submitted: not accepted")
+                reason = str(submit_res.get("reason", "not_accepted"))
+                if reason == "anchor_guard":
+                    mae = submit_res.get("anchor_mae")
+                    corr = submit_res.get("anchor_rank_corr")
+                    print(
+                        f"[{jobs_done}] Submitted: rejected by anchor guard "
+                        f"(mae={mae:.6f}, rank_corr={corr:.6f})"
+                    )
+                else:
+                    print(f"[{jobs_done}] Submitted: not accepted ({reason})")
 
             if args.max_jobs > 0 and jobs_done >= args.max_jobs:
                 print("Reached --max-jobs limit. Exiting.")

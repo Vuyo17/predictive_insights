@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import numpy as np
+import pandas as pd
 
 from continuous_improve_pipeline import (
     auto_find_data_paths,
@@ -67,6 +68,10 @@ class ControllerState:
         self.best_candidate_meta: Optional[Dict[str, object]] = None
         self.output_dir = Path("outputs")
         self.benchmark_state_file = Path(".improver_state.json")
+        self.anchor_predictions: Optional[np.ndarray] = None
+        self.anchor_name: str = ""
+        self.anchor_max_mae: float = 0.08
+        self.anchor_min_rank_corr: float = 0.985
 
     def log_event(self, kind: str, message: str, extra: Optional[Dict[str, Any]] = None) -> None:
         payload = {
@@ -80,6 +85,29 @@ class ControllerState:
 
 
 STATE = ControllerState()
+
+
+def _rank_corr(a: np.ndarray, b: np.ndarray) -> float:
+    a_rank = pd.Series(a).rank(method="average").to_numpy(dtype=float)
+    b_rank = pd.Series(b).rank(method="average").to_numpy(dtype=float)
+    if a_rank.std() == 0.0 or b_rank.std() == 0.0:
+        return 0.0
+    return float(np.corrcoef(a_rank, b_rank)[0, 1])
+
+
+def load_anchor_predictions(anchor_file: Path, test_ids: pd.Series) -> Optional[np.ndarray]:
+    if not anchor_file.exists():
+        return None
+
+    df = pd.read_csv(anchor_file)
+    if "anonymised_id" not in df.columns or "employed_status" not in df.columns:
+        return None
+
+    anchor = df[["anonymised_id", "employed_status"]].copy()
+    merged = pd.DataFrame({"anonymised_id": test_ids}).merge(anchor, on="anonymised_id", how="left")
+    if merged["employed_status"].isna().any():
+        return None
+    return merged["employed_status"].to_numpy(dtype=float)
 
 
 def resolve_lan_ip() -> str:
@@ -402,10 +430,36 @@ class Handler(BaseHTTPRequestHandler):
                         self._json(HTTPStatus.OK, {"accepted": False, "reason": "duplicate_prediction"})
                         return
 
+                    if STATE.anchor_predictions is not None:
+                        anchor_mae = float(np.mean(np.abs(test_pred - STATE.anchor_predictions)))
+                        anchor_rank_corr = _rank_corr(test_pred, STATE.anchor_predictions)
+                        if anchor_mae > STATE.anchor_max_mae or anchor_rank_corr < STATE.anchor_min_rank_corr:
+                            STATE.log_event(
+                                "anchor_reject",
+                                (
+                                    f"Worker {worker_id[:8]} candidate rejected by anchor guard "
+                                    f"(mae={anchor_mae:.6f}, rank_corr={anchor_rank_corr:.6f})"
+                                ),
+                                {
+                                    "job_id": job_id,
+                                    "anchor": STATE.anchor_name,
+                                    "anchor_mae": anchor_mae,
+                                    "anchor_rank_corr": anchor_rank_corr,
+                                },
+                            )
+                            self._json(
+                                HTTPStatus.OK,
+                                {
+                                    "accepted": False,
+                                    "reason": "anchor_guard",
+                                    "anchor_mae": anchor_mae,
+                                    "anchor_rank_corr": anchor_rank_corr,
+                                },
+                            )
+                            return
+
                     STATE.output_dir.mkdir(parents=True, exist_ok=True)
                     out_path = STATE.output_dir / f"submission{STATE.next_index}.csv"
-                    import pandas as pd
-
                     pd.DataFrame(
                         {"anonymised_id": STATE.test_ids, "employed_status": test_pred}
                     ).to_csv(out_path, index=False)
@@ -452,6 +506,8 @@ def run_controller(args: argparse.Namespace) -> None:
     STATE.benchmark_state_file = args.benchmark_state_file
 
     prepare_data(args.data_dir, args.train_file, args.test_file, args.max_round)
+    STATE.anchor_max_mae = float(args.anchor_max_mae)
+    STATE.anchor_min_rank_corr = float(args.anchor_min_rank_corr)
 
     baseline = args.baseline_override if args.baseline_override is not None else args.fallback_baseline
     bench = load_benchmark_state(args.benchmark_state_file)
@@ -459,6 +515,24 @@ def run_controller(args: argparse.Namespace) -> None:
     STATE.best_cv_auc = max(float(baseline), persisted_best)
     STATE.next_index = next_submission_index(args.output_dir)
     STATE.seen_hashes = load_existing_prediction_hashes(args.output_dir)
+
+    if args.anchor_file is not None:
+        anchor_pred = load_anchor_predictions(args.anchor_file, STATE.test_ids)
+        if anchor_pred is None:
+            STATE.log_event(
+                "anchor",
+                f"Anchor file not loaded: {args.anchor_file}. Continuing without anchor guard.",
+            )
+        else:
+            STATE.anchor_predictions = anchor_pred
+            STATE.anchor_name = args.anchor_file.name
+            STATE.log_event(
+                "anchor",
+                (
+                    f"Anchor loaded from {args.anchor_file.name} "
+                    f"(max_mae={STATE.anchor_max_mae:.4f}, min_rank_corr={STATE.anchor_min_rank_corr:.4f})"
+                ),
+            )
 
     STATE.log_event("startup", f"Controller started with best={STATE.best_cv_auc:.6f} next=submission{STATE.next_index}.csv")
 
@@ -511,6 +585,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-round", type=int, default=9)
+    parser.add_argument(
+        "--anchor-file",
+        type=Path,
+        default=Path("outputs/submission2.csv"),
+        help="Known good submission used as public-score anchor.",
+    )
+    parser.add_argument(
+        "--anchor-max-mae",
+        type=float,
+        default=0.08,
+        help="Reject improvements whose mean absolute deviation from anchor is above this threshold.",
+    )
+    parser.add_argument(
+        "--anchor-min-rank-corr",
+        type=float,
+        default=0.985,
+        help="Reject improvements whose rank-correlation to anchor falls below this threshold.",
+    )
     return parser.parse_args()
 
 
